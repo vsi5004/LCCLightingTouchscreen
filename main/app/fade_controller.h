@@ -2,9 +2,10 @@
  * @file fade_controller.h
  * @brief Lighting Fade Controller
  * 
- * Manages smooth transitions between lighting states with rate-limited
- * LCC event transmission. Implements linear interpolation with fractional
- * accumulation to ensure accurate endpoint delivery.
+ * Sends lighting scene parameters and transition duration to LED controllers
+ * via LCC events. LED controllers perform local high-fidelity fading.
+ * For long fades (>255 seconds), automatically segments into multiple
+ * command sets with intermediate targets.
  * 
  * @see docs/ARCHITECTURE.md §6 for Fade Algorithm specification
  * @see docs/SPEC.md §3 for LCC Event Model
@@ -30,7 +31,8 @@ typedef enum {
     LIGHT_PARAM_BLUE = 2,
     LIGHT_PARAM_WHITE = 3,
     LIGHT_PARAM_BRIGHTNESS = 4,
-    LIGHT_PARAM_COUNT = 5
+    LIGHT_PARAM_DURATION = 5,   ///< Transition duration in seconds (triggers fade on receivers)
+    LIGHT_PARAM_COUNT = 6
 } light_param_t;
 
 /**
@@ -38,7 +40,7 @@ typedef enum {
  */
 typedef enum {
     FADE_STATE_IDLE = 0,    ///< No active fade
-    FADE_STATE_FADING,      ///< Fade in progress
+    FADE_STATE_FADING,      ///< Fade in progress (for progress bar display)
     FADE_STATE_COMPLETE     ///< Fade just completed (transitions to IDLE on next tick)
 } fade_state_t;
 
@@ -62,14 +64,14 @@ typedef struct {
 } fade_params_t;
 
 /**
- * @brief Fade progress information
+ * @brief Fade progress information (for UI progress bar)
  */
 typedef struct {
     fade_state_t state;         ///< Current fade state
-    uint8_t progress_percent;   ///< Progress 0-100%
-    uint32_t elapsed_ms;        ///< Elapsed time in ms
-    uint32_t total_ms;          ///< Total duration in ms
-    lighting_state_t current;   ///< Current lighting values
+    uint8_t progress_percent;   ///< Progress 0-100% (across all segments)
+    uint32_t elapsed_ms;        ///< Elapsed time in ms (total)
+    uint32_t total_ms;          ///< Total duration in ms (all segments)
+    lighting_state_t current;   ///< Target lighting values (what LEDs are fading to)
 } fade_progress_t;
 
 /**
@@ -106,13 +108,13 @@ esp_err_t fade_controller_apply_immediate(const lighting_state_t *state);
 /**
  * @brief Process fade controller tick
  * 
- * Must be called periodically (recommended: every 10-20ms) to drive
- * the fade state machine and transmit LCC events.
+ * Must be called periodically (recommended: every 100ms) to:
+ * - Track elapsed time for progress bar display
+ * - Send next segment commands for long fades (>255 seconds)
+ * - Transition to COMPLETE state when fade finishes
  * 
- * This function handles:
- * - Time-based interpolation
- * - Rate-limited event transmission (20ms minimum interval)
- * - Transmission ordering (Brightness first, then R, G, B, W)
+ * Note: Unlike previous implementation, this does NOT send continuous
+ * LCC events. LED controllers perform local high-fidelity fading.
  * 
  * @return ESP_OK on success, ESP_ERR_NOT_FOUND if not initialized
  */

@@ -21,6 +21,14 @@ extern "C" {
 #include <stdbool.h>
 
 /**
+ * @brief Default LCC node ID if nodeid.txt is not present
+ * 
+ * Format: 05.01.01.01.9F.60.00
+ * This should be unique per device in production.
+ */
+#define LCC_DEFAULT_NODE_ID 0x050101019F6000ULL
+
+/**
  * @brief LCC Node status
  */
 typedef enum {
@@ -114,6 +122,24 @@ uint16_t lcc_node_get_screen_timeout_sec(void);
  * @return ESP_OK on success, error code otherwise
  */
 esp_err_t lcc_node_send_lighting_event(uint8_t parameter, uint8_t value);
+
+/**
+ * @brief Request reboot into bootloader mode for firmware update
+ * 
+ * Sets an RTC memory flag and restarts the device. On the next boot,
+ * the device will enter bootloader mode to receive firmware updates
+ * via the LCC Memory Configuration Protocol (memory space 0xEF).
+ * 
+ * This can be triggered by:
+ * - JMRI Firmware Update tool
+ * - OpenMRN bootloader_client command-line tool
+ * - Any LCC configuration tool that sends the "enter bootloader" command
+ * 
+ * @note This function does not return - the device will restart.
+ * 
+ * @see FR-060 Firmware update via LCC
+ */
+void lcc_node_request_bootloader(void);
 
 /**
  * @brief Shutdown the LCC node

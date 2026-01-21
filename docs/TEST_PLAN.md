@@ -1,98 +1,68 @@
 # Test Plan
 
-## Unit Tests
+> **Note:** This project uses manual testing during development. The test cases 
+> below document expected behavior for reference and future regression testing.
+> Formal unit tests and automated integration tests are not currently implemented.
 
-### Fade Algorithm (`test_fade.c`)
-- Fade math with various deltas
-- Rounding accumulation (no drift)
-- Step count calculation
-- Interval clamping to 10ms minimum
+## Manual Test Cases
 
-### Rate Limiter (`test_rate_limiter.c`)
-- Enforces ≥10ms spacing between transmission rounds
-- Burst transmission (all 5 params per round)
-- Timer accuracy within ±1ms
+### Fade Controller Behavior
+- Segment calculation for long fades (>255s) divides into equal segments
+- Progress calculation works across multiple segments
+- Immediate apply (Duration=0) sends events instantly
 
-### Scene Manager (`test_scene_manager.c`)
-- JSON parsing valid scenes
-- JSON parsing with missing fields
-- JSON parsing with invalid values
-- Version mismatch detection
-- Atomic save (simulate power loss)
+### Scene Management
+- JSON parsing handles valid scenes correctly
+- Missing or corrupt scenes.json falls back gracefully
+- Scene edits persist across reboots
 
-### Config Manager (`test_config.c`)
-- Parse valid nodeid.txt
-- Parse with invalid node ID format
-- Fallback to defaults
+### Configuration
+- Valid nodeid.txt is parsed correctly
+- Invalid node ID format falls back to default
+- LCC configuration changes persist via CDI
 
 ---
 
-## Integration Tests
+## Functional Verification Checklist
 
-### Manual Control Flow
-| Test | Steps | Expected |
-|------|-------|----------|
-| IT-001 | Set sliders, press Update | 5 CAN events in order (B,R,G,B,W) |
-| IT-002 | Update with no changes | 5 CAN events with current values |
-| IT-003 | Save Scene flow | Modal appears, scene saved to SD |
+### Manual Control Tab
+- [ ] Sliders adjust RGBW and brightness values (0-255)
+- [ ] Color preview circle updates in real-time
+- [ ] Apply button sends 6 LCC events (R,G,B,W,Br,Dur=0)
+- [ ] Save Scene modal allows naming and saving current values
 
-### Scene Application
-| Test | Steps | Expected |
-|------|-------|----------|
-| IT-010 | Apply scene, 0s duration | Immediate 5 events |
-| IT-011 | Apply scene, 10s duration | Gradual fade, event rounds ≥10ms apart |
-| IT-012 | Apply during fade | Previous fade cancelled |
-| IT-013 | Apply same scene | No events (optimization) |
+### Scene Selector Tab
+- [ ] Scene cards display with color preview circles
+- [ ] Horizontal scroll with center-snapping works
+- [ ] Duration slider adjusts fade time (0-300s)
+- [ ] Apply button starts fade with progress bar
+- [ ] Edit button opens modal with sliders and name input
+- [ ] Preview button in edit modal sends current values
+- [ ] Delete button shows confirmation modal
+- [ ] Scene reordering (move left/right) works
 
-### Persistence
-| Test | Steps | Expected |
-|------|-------|----------|
-| IT-020 | Save scene, reboot | Scene appears in carousel |
-| IT-021 | Corrupt scenes.json | Fallback to empty scene list |
-| IT-022 | Missing nodeid.txt | Default node ID used |
+### Fade Behavior
+- [ ] Short fades (<255s) send single command set
+- [ ] Long fades (>255s) segment into equal chunks
+- [ ] Progress bar tracks overall fade progress
+- [ ] Fade interruption works (new apply during fade)
 
-### Auto-Apply on Boot
-| Test | Steps | Expected |
-|------|-------|----------|
-| IT-030 | Enable auto-apply, set 10s duration, reboot | First scene fades in over 10s, progress bar visible |
-| IT-031 | Disable auto-apply, reboot | No fade, lights remain off |
-| IT-032 | Enable auto-apply, no scenes saved | No fade occurs, no crash |
-| IT-033 | Auto-apply with 0s duration | First scene applied immediately |
+### Boot Behavior
+- [ ] Splash screen displays on startup
+- [ ] Auto-apply (if enabled) fades to first scene
+- [ ] Missing SD card shows error screen
+- [ ] Missing nodeid.txt uses default node ID
 
----
+### Power Saving
+- [ ] Screen dims after configured timeout
+- [ ] Touch wakes screen with fade-in animation
+- [ ] Timeout of 0 keeps screen always on
 
-## Hardware-in-the-Loop Tests
-
-### CAN Bus Verification
-- Use CAN analyzer (PCAN, Kvaser, etc.)
-- Verify ≥10ms spacing between transmission rounds (5 events per round)
-- Verify correct event IDs per INTERFACES.md §7
-- Verify 125 kbps bit rate
-
-### JMRI Integration
-- Node appears in JMRI node browser
-- Event IDs configurable via CDI (if implemented)
-- Events received and logged correctly
-
-### Display/Touch
-- Splash image displays within 1500ms
-- Touch coordinates map correctly
-- Slider values update smoothly
-- No screen tearing during animations
-
-### SD Card
-- Boot without SD card shows error
-- Corrupt files handled gracefully
-- Large scene files (50+ scenes) load correctly
+### LCC Integration
+- [ ] Node appears on LCC network with configured ID
+- [ ] Base event ID configurable via CDI tools (JMRI)
+- [ ] Events use correct format per INTERFACES.md
+- [ ] OTA firmware update works via JMRI
 
 ---
 
-## Performance Benchmarks
-
-| Metric | Target | Measurement Method |
-|--------|--------|-------------------|
-| Boot to splash | <500ms | Stopwatch/logic analyzer |
-| Splash to UI | <5000ms | Stopwatch |
-| Touch latency | <50ms | Touch + oscilloscope on CAN |
-| Fade timing accuracy | ±2% | CAN analyzer timestamps |
-| UI frame rate | ≥30 FPS | LVGL stats or visual |

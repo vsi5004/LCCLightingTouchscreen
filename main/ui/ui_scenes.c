@@ -181,7 +181,7 @@ static void progress_timer_cb(lv_timer_t *timer)
             lv_obj_clear_flag(s_progress_bar, LV_OBJ_FLAG_HIDDEN);
             lv_bar_set_value(s_progress_bar, 0, LV_ANIM_OFF);
         }
-        ESP_LOGI(TAG, "Progress tracking started from pending request");
+        ESP_LOGD(TAG, "Progress tracking started from pending request");
     }
     
     // If we're not tracking a transition, nothing to do
@@ -208,7 +208,7 @@ static void progress_timer_cb(lv_timer_t *timer)
         s_scenes_state.transition_in_progress = false;
         s_scenes_state.fade_started = false;
         
-        ESP_LOGI(TAG, "Fade complete, progress bar hidden");
+        ESP_LOGD(TAG, "Fade complete, progress bar hidden");
     }
 }
 
@@ -236,7 +236,7 @@ void ui_scenes_start_progress_tracking(void)
 {
     // Set pending flag - the persistent timer will pick this up
     s_scenes_state.pending_progress_start = true;
-    ESP_LOGI(TAG, "Progress tracking requested (pending)");
+    ESP_LOGD(TAG, "Progress tracking requested (pending)");
 }
 
 /**
@@ -244,11 +244,11 @@ void ui_scenes_start_progress_tracking(void)
  */
 static void apply_btn_event_cb(lv_event_t *e)
 {
-    ESP_LOGI(TAG, "Apply button pressed");
+    ESP_LOGD(TAG, "Apply button pressed");
     
     if (s_cached_scene_count > 0 && s_scenes_state.current_scene_index < (int)s_cached_scene_count) {
         ui_scene_t *scene = &s_cached_scenes[s_scenes_state.current_scene_index];
-        ESP_LOGI(TAG, "Applying scene '%s': B=%d R=%d G=%d B=%d W=%d, Duration=%d sec",
+        ESP_LOGD(TAG, "Applying scene '%s': B=%d R=%d G=%d B=%d W=%d, Duration=%d sec",
                  scene->name, scene->brightness, scene->red, scene->green,
                  scene->blue, scene->white, s_scenes_state.transition_duration_sec);
         
@@ -297,12 +297,12 @@ static void close_delete_modal(void)
  */
 static void delete_confirm_btn_cb(lv_event_t *e)
 {
-    ESP_LOGI(TAG, "Delete confirmed for scene: %s", s_scenes_state.pending_delete_name);
+    ESP_LOGD(TAG, "Delete confirmed for scene: %s", s_scenes_state.pending_delete_name);
     
     // Delete from SD card
     esp_err_t ret = scene_storage_delete(s_scenes_state.pending_delete_name);
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Scene deleted successfully");
+        ESP_LOGD(TAG, "Scene deleted successfully");
         // Refresh the carousel - already in LVGL context, use no-lock version
         scene_storage_reload_ui_no_lock();
     } else {
@@ -317,7 +317,7 @@ static void delete_confirm_btn_cb(lv_event_t *e)
  */
 static void delete_cancel_btn_cb(lv_event_t *e)
 {
-    ESP_LOGI(TAG, "Delete cancelled");
+    ESP_LOGD(TAG, "Delete cancelled");
     close_delete_modal();
 }
 
@@ -479,7 +479,7 @@ static void edit_slider_event_cb(lv_event_t *e)
  */
 static void edit_cancel_btn_cb(lv_event_t *e)
 {
-    ESP_LOGI(TAG, "Edit cancelled");
+    ESP_LOGD(TAG, "Edit cancelled");
     close_edit_modal();
 }
 
@@ -488,7 +488,7 @@ static void edit_cancel_btn_cb(lv_event_t *e)
  */
 static void edit_preview_btn_cb(lv_event_t *e)
 {
-    ESP_LOGI(TAG, "Preview: B=%d R=%d G=%d B=%d W=%d",
+    ESP_LOGD(TAG, "Preview: B=%d R=%d G=%d B=%d W=%d",
              s_edit_state.brightness, s_edit_state.red, s_edit_state.green,
              s_edit_state.blue, s_edit_state.white);
     
@@ -518,7 +518,7 @@ static void edit_save_btn_cb(lv_event_t *e)
         return;
     }
     
-    ESP_LOGI(TAG, "Saving edited scene at index %d: '%s' B=%d R=%d G=%d B=%d W=%d",
+    ESP_LOGD(TAG, "Saving edited scene at index %d: '%s' B=%d R=%d G=%d B=%d W=%d",
              s_edit_state.scene_index, new_name, s_edit_state.brightness,
              s_edit_state.red, s_edit_state.green, s_edit_state.blue, s_edit_state.white);
     
@@ -528,7 +528,7 @@ static void edit_save_btn_cb(lv_event_t *e)
         s_edit_state.blue, s_edit_state.white);
     
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Scene updated successfully");
+        ESP_LOGD(TAG, "Scene updated successfully");
         close_edit_modal();
         // Refresh UI - already in LVGL context, use no-lock version
         scene_storage_reload_ui_no_lock();
@@ -550,7 +550,7 @@ static void edit_move_left_btn_cb(lv_event_t *e)
     }
     
     size_t new_index = s_edit_state.scene_index - 1;
-    ESP_LOGI(TAG, "Moving scene from %d to %d", s_edit_state.scene_index, (int)new_index);
+    ESP_LOGD(TAG, "Moving scene from %d to %d", s_edit_state.scene_index, (int)new_index);
     
     esp_err_t ret = scene_storage_reorder(s_edit_state.scene_index, new_index);
     if (ret == ESP_OK) {
@@ -581,7 +581,7 @@ static void edit_move_right_btn_cb(lv_event_t *e)
     }
     
     size_t new_index = s_edit_state.scene_index + 1;
-    ESP_LOGI(TAG, "Moving scene from %d to %d", s_edit_state.scene_index, (int)new_index);
+    ESP_LOGD(TAG, "Moving scene from %d to %d", s_edit_state.scene_index, (int)new_index);
     
     esp_err_t ret = scene_storage_reorder(s_edit_state.scene_index, new_index);
     if (ret == ESP_OK) {

@@ -36,6 +36,14 @@
 #include "app/lcc_node.h"
 #include "app/fade_controller.h"
 #include "app/screen_timeout.h"
+#include "app/bootloader_hal.h"
+
+// For reset reason detection (FR-060)
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+#include "esp32s3/rom/rtc.h"
+#elif defined(CONFIG_IDF_TARGET_ESP32)
+#include "esp32/rom/rtc.h"
+#endif
 
 static const char *TAG = "main";
 
@@ -495,6 +503,64 @@ void app_main(void)
     ESP_LOGI(TAG, "LCC Lighting Scene Controller starting...");
     ESP_LOGI(TAG, "ESP-IDF version: %s", esp_get_idf_version());
     ESP_LOGI(TAG, "Free heap at start: %lu bytes", esp_get_free_heap_size());
+
+    // ========================================================================
+    // Bootloader Check (FR-060)
+    // ========================================================================
+    // Must be done BEFORE any other initialization to enter bootloader mode
+    // as quickly as possible for firmware updates.
+    uint8_t reset_reason = rtc_get_reset_reason(0);
+    ESP_LOGI(TAG, "Reset reason: %d", reset_reason);
+    
+    // Initialize bootloader HAL (sets up RTC memory flag on power-on)
+    bootloader_hal_init(reset_reason);
+    
+    // Check if bootloader mode was requested (via LCC command or button)
+    if (bootloader_hal_should_enter()) {
+        ESP_LOGI(TAG, "Entering bootloader mode for firmware update...");
+        
+        // Read node ID from SD card first (need to init I2C and SD for this)
+        // For now, use a fallback approach: init minimal hardware
+        esp_err_t ret = init_i2c();
+        if (ret == ESP_OK) {
+            ch422g_config_t ch422g_config = {
+                .i2c_port = I2C_NUM_0,
+                .timeout_ms = 1000,
+            };
+            ret = ch422g_init(&ch422g_config, &s_ch422g);
+        }
+        
+        // Try to read node ID from SD, fall back to default if not available
+        uint64_t bootloader_node_id = LCC_DEFAULT_NODE_ID;
+        if (ret == ESP_OK) {
+            waveshare_sd_config_t sd_config = {
+                .mosi_gpio = CONFIG_SD_MOSI_GPIO,
+                .miso_gpio = CONFIG_SD_MISO_GPIO,
+                .clk_gpio = CONFIG_SD_CLK_GPIO,
+                .mount_point = CONFIG_SD_MOUNT_POINT,
+                .ch422g_handle = s_ch422g,
+                .max_files = 5,
+                .format_if_mount_failed = false,
+            };
+            if (waveshare_sd_init(&sd_config, &s_sd_card) == ESP_OK) {
+                // Try to read node ID
+                bootloader_node_id = lcc_node_get_node_id();
+                if (bootloader_node_id == 0) {
+                    bootloader_node_id = LCC_DEFAULT_NODE_ID;
+                }
+            }
+        }
+        
+        // Run bootloader (does not return - reboots when done)
+        bootloader_hal_run(bootloader_node_id, 
+                           CONFIG_TWAI_RX_GPIO, 
+                           CONFIG_TWAI_TX_GPIO);
+        
+        // Should never reach here
+        esp_restart();
+    }
+    // ========================================================================
+
 
     // Initialize NVS (required for some ESP-IDF components)
     ESP_LOGI(TAG, "Initializing NVS...");

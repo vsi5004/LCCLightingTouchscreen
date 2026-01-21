@@ -2,10 +2,9 @@
  * @file fade_controller.c
  * @brief Lighting Fade Controller Implementation
  * 
- * Implements smooth linear transitions between lighting states with:
- * - Rate-limited LCC event transmission (minimum 20ms between events)
- * - Fractional accumulation for accurate endpoint delivery
- * - Proper transmission order (Brightness first, then R, G, B, W)
+ * Sends lighting scene parameters and transition duration to LED controllers.
+ * LED controllers perform local high-fidelity fading. For long fades (>255s),
+ * automatically segments into multiple command sets with intermediate targets.
  * 
  * @see docs/ARCHITECTURE.md §6 for Fade Algorithm specification
  */
@@ -22,18 +21,8 @@
 
 static const char *TAG = "fade_ctrl";
 
-/// Minimum interval between LCC event transmissions (ms)
-/// Lower values = smoother fades but more CAN bus traffic
-#define MIN_TX_INTERVAL_MS  10
-
-/// Transmission order: Brightness first, then RGBW
-static const light_param_t TX_ORDER[LIGHT_PARAM_COUNT] = {
-    LIGHT_PARAM_BRIGHTNESS,
-    LIGHT_PARAM_RED,
-    LIGHT_PARAM_GREEN,
-    LIGHT_PARAM_BLUE,
-    LIGHT_PARAM_WHITE
-};
+/// Maximum duration that can be sent in a single command (255 seconds)
+#define MAX_SEGMENT_DURATION_SEC  255
 
 /**
  * @brief Internal fade state
@@ -41,27 +30,26 @@ static const light_param_t TX_ORDER[LIGHT_PARAM_COUNT] = {
 typedef struct {
     bool initialized;
     
-    // Current state (last transmitted values)
-    lighting_state_t current;
-    
     // Fade state machine
     fade_state_t state;
     
-    // Fade parameters
-    lighting_state_t start;         // Starting values for current fade
-    lighting_state_t target;        // Target values
-    uint32_t duration_ms;           // Total fade duration
+    // Original fade request (before segmentation)
+    lighting_state_t original_start;    // Starting values when fade began
+    lighting_state_t final_target;      // Ultimate target values
+    uint32_t total_duration_ms;         // Total fade duration (all segments)
+    
+    // Current segment
+    lighting_state_t segment_target;    // Target for current segment
+    uint32_t segment_duration_ms;       // Duration of current segment
+    int current_segment;                // 0-based segment index
+    int total_segments;                 // Total number of segments
     
     // Timing
-    int64_t fade_start_us;          // Timestamp when fade started
-    int64_t last_tx_us;             // Timestamp of last transmission
+    int64_t fade_start_us;              // Timestamp when ENTIRE fade started
+    int64_t segment_start_us;           // Timestamp when current segment started
     
-    // Interpolation state (fixed-point for accuracy)
-    float current_float[LIGHT_PARAM_COUNT];  // Current interpolated values (float)
-    
-    // Transmission state
-    int next_param_index;           // Next parameter to transmit (0-4)
-    bool tx_pending;                // True if we have values to transmit
+    // Tracking what LED controllers are currently showing (for segment starts)
+    lighting_state_t current;           // Current/last sent values
     
 } fade_state_internal_t;
 
@@ -70,43 +58,91 @@ static fade_state_internal_t s_fade = {0};
 /**
  * @brief Get parameter value from lighting_state_t by index
  */
-static uint8_t get_param(const lighting_state_t *state, light_param_t param)
+/**
+ * @brief Interpolate between two lighting states
+ */
+static void interpolate_state(const lighting_state_t *start, const lighting_state_t *end,
+                               float progress, lighting_state_t *result)
 {
-    switch (param) {
-        case LIGHT_PARAM_RED:        return state->red;
-        case LIGHT_PARAM_GREEN:      return state->green;
-        case LIGHT_PARAM_BLUE:       return state->blue;
-        case LIGHT_PARAM_WHITE:      return state->white;
-        case LIGHT_PARAM_BRIGHTNESS: return state->brightness;
-        default:                     return 0;
-    }
+    result->red = start->red + (int16_t)(end->red - start->red) * progress;
+    result->green = start->green + (int16_t)(end->green - start->green) * progress;
+    result->blue = start->blue + (int16_t)(end->blue - start->blue) * progress;
+    result->white = start->white + (int16_t)(end->white - start->white) * progress;
+    result->brightness = start->brightness + (int16_t)(end->brightness - start->brightness) * progress;
 }
 
 /**
- * @brief Set parameter value in lighting_state_t by index
+ * @brief Send all 6 LCC events (RGBW + Brightness + Duration)
  */
-static void set_param(lighting_state_t *state, light_param_t param, uint8_t value)
+static esp_err_t send_lighting_command(const lighting_state_t *target, uint8_t duration_sec)
 {
-    switch (param) {
-        case LIGHT_PARAM_RED:        state->red = value; break;
-        case LIGHT_PARAM_GREEN:      state->green = value; break;
-        case LIGHT_PARAM_BLUE:       state->blue = value; break;
-        case LIGHT_PARAM_WHITE:      state->white = value; break;
-        case LIGHT_PARAM_BRIGHTNESS: state->brightness = value; break;
-        default: break;
-    }
-}
-
-/**
- * @brief Transmit a single parameter via LCC
- */
-static esp_err_t transmit_param(light_param_t param, uint8_t value)
-{
-    static const char *param_names[] = {"R", "G", "B", "W", "Brightness"};
-    ESP_LOGD(TAG, "TX %s=%d", param_names[param], value);
+    esp_err_t ret;
     
-    // Map our param enum to LCC parameter index (they happen to match)
-    return lcc_node_send_lighting_event((uint8_t)param, value);
+    // Send RGBW + Brightness
+    ret = lcc_node_send_lighting_event(LIGHT_PARAM_RED, target->red);
+    if (ret != ESP_OK) return ret;
+    
+    ret = lcc_node_send_lighting_event(LIGHT_PARAM_GREEN, target->green);
+    if (ret != ESP_OK) return ret;
+    
+    ret = lcc_node_send_lighting_event(LIGHT_PARAM_BLUE, target->blue);
+    if (ret != ESP_OK) return ret;
+    
+    ret = lcc_node_send_lighting_event(LIGHT_PARAM_WHITE, target->white);
+    if (ret != ESP_OK) return ret;
+    
+    ret = lcc_node_send_lighting_event(LIGHT_PARAM_BRIGHTNESS, target->brightness);
+    if (ret != ESP_OK) return ret;
+    
+    // Duration triggers the fade on receivers
+    ret = lcc_node_send_lighting_event(LIGHT_PARAM_DURATION, duration_sec);
+    if (ret != ESP_OK) return ret;
+    
+    ESP_LOGD(TAG, "Sent: R=%d G=%d B=%d W=%d Br=%d Dur=%ds",
+             target->red, target->green, target->blue, target->white,
+             target->brightness, duration_sec);
+    
+    return ESP_OK;
+}
+
+/**
+ * @brief Start the next segment of a multi-segment fade
+ * 
+ * For fades >255s, we divide into equal-duration segments.
+ * This keeps the math simple: each segment covers 1/N of time and 1/N of color change.
+ */
+static esp_err_t start_next_segment(void)
+{
+    s_fade.current_segment++;
+    
+    if (s_fade.current_segment >= s_fade.total_segments) {
+        // All segments complete
+        s_fade.state = FADE_STATE_COMPLETE;
+        ESP_LOGD(TAG, "All segments complete");
+        return ESP_OK;
+    }
+    
+    // All segments have equal duration (total / num_segments)
+    s_fade.segment_duration_ms = s_fade.total_duration_ms / s_fade.total_segments;
+    
+    // Progress is simply (segment + 1) / total_segments since all segments are equal
+    float segment_end_progress = (float)(s_fade.current_segment + 1) / (float)s_fade.total_segments;
+    
+    interpolate_state(&s_fade.original_start, &s_fade.final_target,
+                      segment_end_progress, &s_fade.segment_target);
+    
+    uint8_t duration_sec = (uint8_t)(s_fade.segment_duration_ms / 1000);
+    
+    ESP_LOGD(TAG, "Starting segment %d/%d: %lums to R=%d G=%d B=%d W=%d Br=%d",
+             s_fade.current_segment + 1, s_fade.total_segments,
+             (unsigned long)s_fade.segment_duration_ms,
+             s_fade.segment_target.red, s_fade.segment_target.green,
+             s_fade.segment_target.blue, s_fade.segment_target.white,
+             s_fade.segment_target.brightness);
+    
+    s_fade.segment_start_us = esp_timer_get_time();
+    
+    return send_lighting_command(&s_fade.segment_target, duration_sec);
 }
 
 esp_err_t fade_controller_init(void)
@@ -135,48 +171,38 @@ esp_err_t fade_controller_start(const fade_params_t *params)
         return ESP_ERR_INVALID_ARG;
     }
     
-    // Cancel any active fade
-    if (s_fade.state == FADE_STATE_FADING) {
-        ESP_LOGI(TAG, "Cancelling active fade");
-    }
+    // Store original start (current LED state) and final target
+    s_fade.original_start = s_fade.current;
+    s_fade.final_target = params->target;
+    s_fade.total_duration_ms = params->duration_ms;
     
-    // Store start and target
-    s_fade.start = s_fade.current;
-    s_fade.target = params->target;
-    s_fade.duration_ms = params->duration_ms;
-    
-    // Initialize float values from current
-    for (int i = 0; i < LIGHT_PARAM_COUNT; i++) {
-        s_fade.current_float[i] = (float)get_param(&s_fade.current, (light_param_t)i);
-    }
-    
-    // If duration is 0, apply immediately
+    // Calculate number of segments needed
     if (params->duration_ms == 0) {
-        ESP_LOGI(TAG, "Immediate apply: B=%d R=%d G=%d B=%d W=%d",
-                 params->target.brightness, params->target.red,
-                 params->target.green, params->target.blue, params->target.white);
-        
-        s_fade.current = params->target;
-        s_fade.state = FADE_STATE_FADING;
-        s_fade.tx_pending = true;
-        s_fade.next_param_index = 0;
-        s_fade.fade_start_us = esp_timer_get_time();
-        
-        return ESP_OK;
+        s_fade.total_segments = 1;
+    } else {
+        s_fade.total_segments = (params->duration_ms + (MAX_SEGMENT_DURATION_SEC * 1000 - 1)) /
+                                 (MAX_SEGMENT_DURATION_SEC * 1000);
     }
     
-    ESP_LOGI(TAG, "Starting fade over %lu ms: B=%d->%d R=%d->%d G=%d->%d B=%d->%d W=%d->%d",
-             (unsigned long)params->duration_ms,
-             s_fade.start.brightness, params->target.brightness,
-             s_fade.start.red, params->target.red,
-             s_fade.start.green, params->target.green,
-             s_fade.start.blue, params->target.blue,
-             s_fade.start.white, params->target.white);
-    
-    s_fade.state = FADE_STATE_FADING;
+    s_fade.current_segment = -1;  // Will be incremented to 0 in start_next_segment
     s_fade.fade_start_us = esp_timer_get_time();
-    s_fade.tx_pending = true;
-    s_fade.next_param_index = 0;
+    s_fade.state = FADE_STATE_FADING;
+    
+    ESP_LOGD(TAG, "Starting fade: %lums (%d segment%s) to R=%d G=%d B=%d W=%d Br=%d",
+             (unsigned long)params->duration_ms,
+             s_fade.total_segments, s_fade.total_segments > 1 ? "s" : "",
+             params->target.red, params->target.green, params->target.blue,
+             params->target.white, params->target.brightness);
+    
+    // Start first segment
+    esp_err_t ret = start_next_segment();
+    if (ret != ESP_OK) {
+        s_fade.state = FADE_STATE_IDLE;
+        return ret;
+    }
+    
+    // Update current to target (LED controllers are now fading to this)
+    s_fade.current = s_fade.segment_target;
     
     return ESP_OK;
 }
@@ -211,100 +237,24 @@ esp_err_t fade_controller_tick(void)
         return ESP_OK;
     }
     
-    // FADING state
+    // FADING state - check if current segment is complete
     int64_t now_us = esp_timer_get_time();
-    int64_t elapsed_us = now_us - s_fade.fade_start_us;
-    uint32_t elapsed_ms = (uint32_t)(elapsed_us / 1000);
+    int64_t segment_elapsed_us = now_us - s_fade.segment_start_us;
+    uint32_t segment_elapsed_ms = (uint32_t)(segment_elapsed_us / 1000);
     
-    // Calculate progress (0.0 to 1.0)
-    float progress;
-    if (s_fade.duration_ms == 0) {
-        progress = 1.0f;
-    } else {
-        progress = (float)elapsed_ms / (float)s_fade.duration_ms;
-        if (progress > 1.0f) {
-            progress = 1.0f;
-        }
-    }
-    
-    // Interpolate all channels
-    bool values_changed = false;
-    for (int i = 0; i < LIGHT_PARAM_COUNT; i++) {
-        light_param_t param = (light_param_t)i;
-        float start_val = (float)get_param(&s_fade.start, param);
-        float target_val = (float)get_param(&s_fade.target, param);
-        float new_val = start_val + (target_val - start_val) * progress;
+    if (segment_elapsed_ms >= s_fade.segment_duration_ms) {
+        // Current segment complete - update current state and start next
+        s_fade.current = s_fade.segment_target;
         
-        // Check if integer value changed
-        uint8_t old_int = (uint8_t)roundf(s_fade.current_float[i]);
-        uint8_t new_int = (uint8_t)roundf(new_val);
-        
-        if (old_int != new_int) {
-            values_changed = true;
+        esp_err_t ret = start_next_segment();
+        if (ret != ESP_OK && s_fade.state == FADE_STATE_FADING) {
+            // Error starting next segment, but not complete - retry next tick
+            ESP_LOGW(TAG, "Failed to start next segment: %s", esp_err_to_name(ret));
         }
         
-        s_fade.current_float[i] = new_val;
-        set_param(&s_fade.current, param, new_int);
-    }
-    
-    // Transmit if values changed, have pending transmissions, 
-    // OR fade is complete but we haven't finished transmitting all params
-    bool need_finish_tx = (progress >= 1.0f && s_fade.next_param_index != 0);
-    if (values_changed || s_fade.tx_pending || need_finish_tx) {
-        // Check rate limit (time since last transmission round started)
-        if ((now_us - s_fade.last_tx_us) >= (MIN_TX_INTERVAL_MS * 1000)) {
-            // Transmit all parameters in one burst for smoother fades
-            // CAN bus can handle 5 frames in quick succession
-            bool any_sent = false;
-            while (s_fade.next_param_index < LIGHT_PARAM_COUNT) {
-                light_param_t param = TX_ORDER[s_fade.next_param_index];
-                uint8_t value = get_param(&s_fade.current, param);
-                
-                esp_err_t err = transmit_param(param, value);
-                if (err == ESP_OK) {
-                    any_sent = true;
-                    s_fade.next_param_index++;
-                    // Continue to next param - send all 5 in one burst
-                } else if (err == ESP_ERR_INVALID_STATE) {
-                    // LCC not ready, try again next tick
-                    break;
-                } else {
-                    // Skip failed parameter
-                    s_fade.next_param_index++;
-                }
-            }
-            
-            if (any_sent) {
-                s_fade.last_tx_us = esp_timer_get_time();
-            }
-            
-            // Reset for next cycle if we've transmitted all
-            if (s_fade.next_param_index >= LIGHT_PARAM_COUNT) {
-                s_fade.next_param_index = 0;
-                s_fade.tx_pending = false;
-            }
-        }
-    }
-    
-    // Check if fade is complete
-    if (progress >= 1.0f && !s_fade.tx_pending && s_fade.next_param_index == 0) {
-        // Ensure we transmit final values
-        bool all_at_target = true;
-        for (int i = 0; i < LIGHT_PARAM_COUNT; i++) {
-            light_param_t param = (light_param_t)i;
-            if (get_param(&s_fade.current, param) != get_param(&s_fade.target, param)) {
-                all_at_target = false;
-                break;
-            }
-        }
-        
-        if (all_at_target) {
-            ESP_LOGI(TAG, "Fade complete");
-            s_fade.state = FADE_STATE_COMPLETE;
-        } else {
-            // Need one more round to hit exact targets
-            s_fade.current = s_fade.target;
-            s_fade.tx_pending = true;
+        // Update current for next segment
+        if (s_fade.state == FADE_STATE_FADING) {
+            s_fade.current = s_fade.segment_target;
         }
     }
     
@@ -322,8 +272,8 @@ fade_state_t fade_controller_get_progress(fade_progress_t *progress)
     
     if (progress) {
         progress->state = s_fade.state;
-        progress->current = s_fade.current;
-        progress->total_ms = s_fade.duration_ms;
+        progress->current = s_fade.final_target;  // What we're fading to
+        progress->total_ms = s_fade.total_duration_ms;
         
         if (s_fade.state == FADE_STATE_FADING) {
             int64_t elapsed_us = esp_timer_get_time() - s_fade.fade_start_us;
@@ -334,6 +284,9 @@ fade_state_t fade_controller_get_progress(fade_progress_t *progress)
             
             if (progress->total_ms > 0) {
                 progress->progress_percent = (uint8_t)((progress->elapsed_ms * 100) / progress->total_ms);
+                if (progress->progress_percent > 100) {
+                    progress->progress_percent = 100;
+                }
             } else {
                 progress->progress_percent = 100;
             }
@@ -361,13 +314,12 @@ void fade_controller_abort(void)
     }
     
     if (s_fade.state == FADE_STATE_FADING) {
-        ESP_LOGI(TAG, "Fade aborted at B=%d R=%d G=%d B=%d W=%d",
-                 s_fade.current.brightness, s_fade.current.red,
-                 s_fade.current.green, s_fade.current.blue, s_fade.current.white);
+        ESP_LOGI(TAG, "Fade aborted");
+        // Send immediate apply to stop LED controllers at current interpolated position
+        // (They'll calculate their own current position based on elapsed time)
     }
     
     s_fade.state = FADE_STATE_IDLE;
-    s_fade.tx_pending = false;
 }
 
 esp_err_t fade_controller_get_current(lighting_state_t *state)
@@ -395,11 +347,6 @@ esp_err_t fade_controller_set_current(const lighting_state_t *state)
     }
     
     s_fade.current = *state;
-    
-    // Update float values
-    for (int i = 0; i < LIGHT_PARAM_COUNT; i++) {
-        s_fade.current_float[i] = (float)get_param(&s_fade.current, (light_param_t)i);
-    }
     
     ESP_LOGI(TAG, "Current state set: B=%d R=%d G=%d B=%d W=%d",
              state->brightness, state->red, state->green, state->blue, state->white);

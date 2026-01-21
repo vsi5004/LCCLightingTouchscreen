@@ -12,6 +12,7 @@
 
 #include "lcc_node.h"
 #include "lcc_config.hxx"
+#include "bootloader_hal.h"
 
 #include <cstdio>
 #include <cstring>
@@ -30,6 +31,7 @@
 #include "openlcb/ConfiguredProducer.hxx"
 #include "openlcb/ConfigUpdateFlow.hxx"
 #include "utils/ConfigUpdateListener.hxx"
+// AutoSyncFileFlow no longer needed - we fsync after every write in LoggingFileMemorySpace
 #include "freertos_drivers/esp32/Esp32HardwareTwai.hxx"
 #include "utils/format_utils.hxx"
 
@@ -42,9 +44,6 @@ static lcc_status_t s_status = LCC_STATUS_UNINITIALIZED;
 
 /// Node ID read from SD card
 static openlcb::NodeID s_node_id = 0;
-
-/// Default node ID if SD card read fails (should be unique per device!)
-static constexpr openlcb::NodeID DEFAULT_NODE_ID = 0x050101012260ULL;
 
 /// TWAI hardware driver instance
 static Esp32HardwareTwai *s_twai = nullptr;
@@ -164,7 +163,7 @@ static bool read_node_id_from_file(const char *path, openlcb::NodeID *out_id)
 static void create_default_nodeid_file(const char *path)
 {
     ESP_LOGI(TAG, "Creating default nodeid.txt with node ID: %012llx", 
-             (unsigned long long)DEFAULT_NODE_ID);
+             (unsigned long long)LCC_DEFAULT_NODE_ID);
     
     FILE *file = fopen(path, "w");
     if (!file) {
@@ -174,16 +173,100 @@ static void create_default_nodeid_file(const char *path)
 
     // Write in dotted hex format
     fprintf(file, "%02X.%02X.%02X.%02X.%02X.%02X\n",
-            (unsigned)((DEFAULT_NODE_ID >> 40) & 0xFF),
-            (unsigned)((DEFAULT_NODE_ID >> 32) & 0xFF),
-            (unsigned)((DEFAULT_NODE_ID >> 24) & 0xFF),
-            (unsigned)((DEFAULT_NODE_ID >> 16) & 0xFF),
-            (unsigned)((DEFAULT_NODE_ID >> 8) & 0xFF),
-            (unsigned)(DEFAULT_NODE_ID & 0xFF));
+            (unsigned)((LCC_DEFAULT_NODE_ID >> 40) & 0xFF),
+            (unsigned)((LCC_DEFAULT_NODE_ID >> 32) & 0xFF),
+            (unsigned)((LCC_DEFAULT_NODE_ID >> 24) & 0xFF),
+            (unsigned)((LCC_DEFAULT_NODE_ID >> 16) & 0xFF),
+            (unsigned)((LCC_DEFAULT_NODE_ID >> 8) & 0xFF),
+            (unsigned)(LCC_DEFAULT_NODE_ID & 0xFF));
     
     fclose(file);
     ESP_LOGI(TAG, "Created nodeid.txt");
 }
+
+/**
+ * @brief FileMemorySpace that syncs to SD card after every write
+ * 
+ * ESP-IDF's FAT VFS caches file data, which can cause reads to return stale
+ * data after writes unless fsync() is called. This class wraps the standard
+ * file operations and calls fsync() after every write to ensure consistency.
+ */
+class SyncingFileMemorySpace : public openlcb::MemorySpace
+{
+public:
+    SyncingFileMemorySpace(int fd, openlcb::MemorySpace::address_t len)
+        : fd_(fd), fileSize_(len)
+    {
+    }
+
+    bool read_only() override { return false; }
+    
+    openlcb::MemorySpace::address_t max_address() override { return fileSize_; }
+
+    size_t write(openlcb::MemorySpace::address_t destination, const uint8_t *data,
+                 size_t len, errorcode_t *error, Notifiable *again) override
+    {
+        if (fd_ < 0) {
+            *error = openlcb::Defs::ERROR_PERMANENT;
+            return 0;
+        }
+        
+        off_t actual_position = lseek(fd_, destination, SEEK_SET);
+        if ((openlcb::MemorySpace::address_t)actual_position != destination) {
+            *error = openlcb::MemoryConfigDefs::ERROR_OUT_OF_BOUNDS;
+            return 0;
+        }
+        
+        ssize_t ret = ::write(fd_, data, len);
+        if (ret < 0) {
+            *error = openlcb::Defs::ERROR_PERMANENT;
+            return 0;
+        }
+        
+        // Sync immediately so subsequent reads see the written data
+        fsync(fd_);
+        
+        return ret;
+    }
+
+    size_t read(openlcb::MemorySpace::address_t destination, uint8_t *dst,
+                size_t len, errorcode_t *error, Notifiable *again) override
+    {
+        if (fd_ < 0) {
+            *error = openlcb::Defs::ERROR_PERMANENT;
+            return 0;
+        }
+        
+        off_t actual_position = lseek(fd_, destination, SEEK_SET);
+        if ((openlcb::MemorySpace::address_t)actual_position != destination) {
+            *error = openlcb::Defs::ERROR_PERMANENT;
+            return 0;
+        }
+        
+        if (destination >= fileSize_) {
+            *error = openlcb::MemoryConfigDefs::ERROR_OUT_OF_BOUNDS;
+            return 0;
+        }
+        
+        ssize_t ret = ::read(fd_, dst, len);
+        if (ret < 0) {
+            *error = openlcb::Defs::ERROR_PERMANENT;
+            return 0;
+        }
+        
+        return ret;
+    }
+
+private:
+    int fd_;
+    openlcb::MemorySpace::address_t fileSize_;
+};
+
+/// Custom memory space for config (space 253) that syncs after writes
+static SyncingFileMemorySpace* s_config_space = nullptr;
+
+/// Custom memory space for ACDI user (space 251) that syncs after writes  
+static SyncingFileMemorySpace* s_acdi_usr_space = nullptr;
 
 /**
  * @brief Configuration update listener
@@ -211,10 +294,7 @@ public:
         // Read startup configuration
         uint8_t auto_apply_val = s_cfg->seg().startup().auto_apply_enabled().read(fd);
         s_auto_apply_enabled = (auto_apply_val != 0);
-        
         s_auto_apply_duration_sec = s_cfg->seg().startup().auto_apply_duration_sec().read(fd);
-        
-        // Read screen timeout configuration
         s_screen_timeout_sec = s_cfg->seg().startup().screen_timeout_sec().read(fd);
         
         if (initial_load) {
@@ -222,14 +302,6 @@ public:
                      s_auto_apply_enabled ? "enabled" : "disabled",
                      s_auto_apply_duration_sec,
                      s_screen_timeout_sec);
-        }
-        
-        // IMPORTANT: Sync config file to SD card after any changes
-        // FAT filesystem doesn't auto-flush, so without this, changes made
-        // via JMRI/LCC configuration would be lost on reboot
-        if (!initial_load) {
-            ESP_LOGI(TAG, "Config changed - syncing to SD card");
-            fsync(fd);
         }
         
         return UPDATED;
@@ -285,6 +357,13 @@ extern const SimpleNodeStaticValues SNIP_STATIC_DATA = {
 };
 
 /// CDI XML data - defines the configuration interface for this node
+/// This MUST match the C++ ConfigDef layout in lcc_config.hxx
+/// Layout:
+///   - space 251 (ACDI user space): User Info at origin 1
+///   - space 253 (config space): Main segment at origin 128
+///     - InternalConfigData (4 bytes at offset 128)
+///     - StartupConfig (5 bytes at offset 132: 1+2+2)
+///     - LightingConfig (8 bytes at offset 137)
 const char CDI_DATA[] =
     R"xmldata(<?xml version="1.0"?>
 <cdi xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://openlcb.org/schema/cdi/1/1/cdi.xsd">
@@ -302,7 +381,31 @@ const char CDI_DATA[] =
     <string size="64"><name>User Description</name></string>
   </group>
 </segment>
-<segment space="253" origin="132">
+<segment space="253" origin="128">
+  <group offset="4">
+    <name>Startup Behavior</name>
+    <int size="1">
+      <name>Auto-Apply First Scene on Boot</name>
+      <description>When enabled (1), automatically applies the first scene in the scene list after startup. Set to 0 to disable.</description>
+      <min>0</min>
+      <max>1</max>
+      <default>1</default>
+    </int>
+    <int size="2">
+      <name>Auto-Apply Transition Duration (seconds)</name>
+      <description>Duration in seconds for the automatic scene transition at startup. Range: 0-300 seconds. Default: 10 seconds.</description>
+      <min>0</min>
+      <max>300</max>
+      <default>10</default>
+    </int>
+    <int size="2">
+      <name>Screen Backlight Timeout (seconds)</name>
+      <description>Time in seconds before the screen backlight turns off when idle. Touch the screen to wake. Set to 0 to disable (always on). Range: 0 or 10-3600 seconds. Default: 60 seconds.</description>
+      <min>0</min>
+      <max>3600</max>
+      <default>60</default>
+    </int>
+  </group>
   <group>
     <name>Lighting Configuration</name>
     <eventid>
@@ -353,8 +456,8 @@ esp_err_t lcc_node_init(const lcc_config_t *config)
 
     // Read node ID from SD card
     if (!read_node_id_from_file(cfg.nodeid_path, &s_node_id)) {
-        ESP_LOGW(TAG, "Using default node ID: %012llx", (unsigned long long)DEFAULT_NODE_ID);
-        s_node_id = DEFAULT_NODE_ID;
+        ESP_LOGW(TAG, "Using default node ID: %012llx", (unsigned long long)LCC_DEFAULT_NODE_ID);
+        s_node_id = LCC_DEFAULT_NODE_ID;
         
         // Create the file with default ID so user can edit it
         create_default_nodeid_file(cfg.nodeid_path);
@@ -386,7 +489,6 @@ esp_err_t lcc_node_init(const lcc_config_t *config)
     // Create config file if needed (this also handles factory reset)
     ESP_LOGI(TAG, "Checking config file...");
     
-    // We need to create the config file before starting the stack
     int config_fd = s_stack->create_config_file_if_needed(
         s_cfg->seg().internal_config(),
         openlcb::CANONICAL_VERSION,
@@ -399,16 +501,8 @@ esp_err_t lcc_node_init(const lcc_config_t *config)
         return ESP_FAIL;
     }
 
-    // IMPORTANT: Sync config file to SD card - FAT filesystem doesn't auto-flush
-    // This is needed because OpenMRN's factory_reset writes don't call fsync()
-    ESP_LOGI(TAG, "Syncing config file to SD card...");
+    // Sync config file to SD card after factory reset writes
     fsync(config_fd);
-
-    // Debug: log the actual offsets being used
-    ESP_LOGI(TAG, "Config offsets - userinfo.name: %d, userinfo.desc: %d, lighting.base_event_id: %d",
-             (int)s_cfg->userinfo().name().offset(),
-             (int)s_cfg->userinfo().description().offset(),
-             (int)s_cfg->seg().lighting().base_event_id().offset());
 
     // Read initial base event ID from config
     s_base_event_id = s_cfg->seg().lighting().base_event_id().read(config_fd);
@@ -418,9 +512,24 @@ esp_err_t lcc_node_init(const lcc_config_t *config)
     ESP_LOGI(TAG, "Adding CAN port...");
     s_stack->add_can_port_select("/dev/twai/twai0");
 
-    // Start the executor thread
+    // Start the executor thread - this also calls default_start_node() which
+    // registers the default FileMemorySpace
     ESP_LOGI(TAG, "Starting executor thread...");
     s_stack->start_executor_thread("lcc_exec", 5, 4096);
+
+    // Register our custom SyncingFileMemorySpace instances to replace the defaults.
+    // These call fsync() after every write to ensure data is persisted to SD card
+    // and subsequent reads return the updated values.
+    
+    // Space 253 (SPACE_CONFIG) - main configuration space
+    s_config_space = new SyncingFileMemorySpace(config_fd, openlcb::CONFIG_FILE_SIZE);
+    s_stack->memory_config_handler()->registry()->insert(
+        s_stack->node(), openlcb::MemoryConfigDefs::SPACE_CONFIG, s_config_space);
+    
+    // Space 251 (SPACE_ACDI_USR) - user info (name, description)
+    s_acdi_usr_space = new SyncingFileMemorySpace(config_fd, 128);
+    s_stack->memory_config_handler()->registry()->insert(
+        s_stack->node(), openlcb::MemoryConfigDefs::SPACE_ACDI_USR, s_acdi_usr_space);
 
     s_status = LCC_STATUS_RUNNING;
     ESP_LOGI(TAG, "LCC node initialized and running");
@@ -465,14 +574,15 @@ esp_err_t lcc_node_send_lighting_event(uint8_t parameter, uint8_t value)
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (parameter > 4) {
-        ESP_LOGE(TAG, "Invalid parameter index: %d", parameter);
+    if (parameter > 5) {
+        ESP_LOGE(TAG, "Invalid parameter index: %d (max 5)", parameter);
         return ESP_ERR_INVALID_ARG;
     }
 
     // Construct event ID: base_event_id with parameter in byte 6 and value in byte 7
     // Base: XX.XX.XX.XX.XX.XX.00.00
     // Result: XX.XX.XX.XX.XX.XX.PP.VV
+    // Parameters: 0=Red, 1=Green, 2=Blue, 3=White, 4=Brightness, 5=Duration
     uint64_t event_id = (s_base_event_id & 0xFFFFFFFFFFFF0000ULL) |
                         ((uint64_t)parameter << 8) |
                         ((uint64_t)value);
@@ -483,6 +593,15 @@ esp_err_t lcc_node_send_lighting_event(uint8_t parameter, uint8_t value)
     s_stack->send_event(event_id);
 
     return ESP_OK;
+}
+
+void lcc_node_request_bootloader(void)
+{
+    ESP_LOGI(TAG, "Bootloader mode requested via LCC");
+    
+    // Request reboot into bootloader mode
+    // This function does not return - device will restart
+    bootloader_hal_request_reboot();
 }
 
 void lcc_node_shutdown(void)

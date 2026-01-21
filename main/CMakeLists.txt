@@ -5,6 +5,8 @@ idf_component_register(
         "app/lcc_node.cpp"
         "app/fade_controller.c"
         "app/screen_timeout.c"
+        "app/bootloader_hal.cpp"
+        "app/bootloader_display.c"
         "ui/ui_common.c"
         "ui/ui_main.c"
         "ui/ui_manual.c"
@@ -24,10 +26,12 @@ idf_component_register(
         lvgl__lvgl
         json
         OpenMRN
+        app_update
 )
 
 # Set C++ standard for OpenMRN compatibility
 set_source_files_properties(
     "app/lcc_node.cpp"
+    "app/bootloader_hal.cpp"
     PROPERTIES COMPILE_FLAGS "-std=gnu++14 -fno-strict-aliasing"
 )

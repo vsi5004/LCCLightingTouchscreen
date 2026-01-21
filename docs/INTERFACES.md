@@ -145,29 +145,34 @@ framebuffer data from PSRAM to the display controller:
 ## 7. LCC Event Mapping
 
 ### Node ID
-Configured in `/sdcard/nodeid.txt` (12 hex digits, e.g., `050101012260`)
+Configured in `/sdcard/nodeid.txt` (14 hex digits with dots, e.g., `05.01.01.01.9F.60.00`)
 
 ### Base Event ID
 Configured via LCC CDI, stored in `/sdcard/openmrn_config` at offset 132.
-Default: `05.01.01.01.22.60.00.00`
+Default: `05.01.01.01.9F.60.00.00`
 
 ### Parameter Offsets
 | Parameter | Offset (byte 6) | Event ID Example |
 |-----------|-----------------|------------------|
-| Red | 0x00 | 05.01.01.01.22.60.00.xx |
-| Green | 0x01 | 05.01.01.01.22.60.01.xx |
-| Blue | 0x02 | 05.01.01.01.22.60.02.xx |
-| White | 0x03 | 05.01.01.01.22.60.03.xx |
-| Brightness | 0x04 | 05.01.01.01.22.60.04.xx |
+| Red | 0x00 | 05.01.01.01.9F.60.00.xx |
+| Green | 0x01 | 05.01.01.01.9F.60.01.xx |
+| Blue | 0x02 | 05.01.01.01.9F.60.02.xx |
+| White | 0x03 | 05.01.01.01.9F.60.03.xx |
+| Brightness | 0x04 | 05.01.01.01.9F.60.04.xx |
+| Duration | 0x05 | 05.01.01.01.9F.60.05.xx |
 
 Where `xx` is the parameter value (0x00–0xFF).
 
-### Transmission Order
-1. Brightness
-2. Red
-3. Green
-4. Blue
-5. White
+### Duration-Triggered Fade Protocol
 
-Minimum interval between transmission rounds: 10ms
-Transmission mode: Burst (all 5 params sent together)
+The touchscreen sends all 6 parameters as a command set:
+1. R, G, B, W, Brightness — target values stored by LED controllers
+2. Duration — triggers fade from current to pending values
+
+**LED controllers perform local interpolation at ~60fps for smooth transitions.**
+
+Duration value meanings:
+- `0x00` — Instant apply (no fade)
+- `0x01`–`0xFF` — Fade over 1–255 seconds
+
+For fades >255 seconds, the touchscreen segments into equal chunks.

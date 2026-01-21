@@ -19,7 +19,8 @@ namespace openlcb
 {
 
 /// Configuration version. Increment when making incompatible changes.
-static constexpr uint16_t CANONICAL_VERSION = 0x0002;
+/// v0x0003: Added Startup Behavior settings to CDI XML (was missing from UI)
+static constexpr uint16_t CANONICAL_VERSION = 0x0003;
 
 /// Default base event ID: 05.01.01.01.22.60.00.00
 static constexpr uint64_t DEFAULT_BASE_EVENT_ID = 0x0501010122600000ULL;

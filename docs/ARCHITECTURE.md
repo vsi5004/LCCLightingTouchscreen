@@ -88,19 +88,18 @@ IDLE ←──────────────────┐
   │                ↓    │
   │            COMPLETE─┘
   │
-  └─ apply_immediate() ─→ (sends all params, stays IDLE)
+  └─ apply_immediate() ─→ (sends all 6 params with Duration=0, stays IDLE)
 ```
 
 **Implemented in `fade_controller.c`:**
-- `fade_controller_start()`: Begins timed fade to target values
-- `fade_controller_apply_immediate()`: Sends all 5 params instantly (rate-limited)
-- `fade_controller_tick()`: Called every 10ms, advances fade state machine
+- `fade_controller_start()`: Sends target + duration, tracks segment progress
+- `fade_controller_apply_immediate()`: Sends all 6 params with Duration=0 (instant)
+- `fade_controller_tick()`: Called periodically, advances to next segment when needed
 - `fade_controller_get_progress()`: Returns 0.0-1.0 for progress bar updates
 - `fade_controller_abort()`: Cancels active fade, resets to IDLE
 
-**Rate Limiting:** Minimum 10ms between transmission rounds
-**Transmission Mode:** Burst (all 5 params sent together each round)
-**Transmission Order:** Brightness → R → G → B → W
+**Protocol:** Duration-triggered (6 events per scene change)
+**Fading:** Performed locally by LED controllers at ~60fps
 
 ---
 
@@ -193,29 +192,54 @@ effect is achieved via LVGL overlay opacity animation while backlight remains on
 
 ### Event Production
 - Event ID format: `{base_event_id[0:6]}.{param_offset}.{value}`
-- Rate limited to ≥10ms between transmission rounds (5 params per round)
+- 6 parameters: R (0), G (1), B (2), W (3), Brightness (4), Duration (5)
+- Duration event triggers fade on LED controllers
 
 ---
 
 ## 6. Fade Algorithm (Normative)
 
-### Algorithm Steps
-1. Compute per-channel delta: `delta[ch] = target[ch] - current[ch]`
-2. Steps = `max(abs(delta[0..4]))`
-3. Ideal interval = `duration_ms / steps`
-4. Actual interval = `max(ideal_interval, 10 ms)`
-5. Actual steps = `duration_ms / actual_interval`
-6. Per-step increment = `delta[ch] / actual_steps` (floating point)
-7. Transmit integer values only (accumulate fractional remainder)
-8. Burst all 5 params together: Brightness, R, G, B, W
+### Duration-Triggered Fade Protocol
+
+The touchscreen acts as a command station, sending target values and transition 
+duration to LED controllers. LED controllers perform local high-fidelity fading.
+
+**Touchscreen responsibilities:**
+1. Calculate target RGBW + Brightness values from scene
+2. Send all 6 LCC events (R, G, B, W, Brightness, Duration)
+3. Track progress for UI display (progress bar)
+4. Handle long fades (>255s) via segmentation
+
+**LED controller responsibilities:**
+1. Store pending R, G, B, W, Brightness as they arrive
+2. On Duration event, capture current values as fade start
+3. Interpolate from current to pending over Duration seconds
+4. Update LEDs at ~60fps (16ms intervals) for smooth transitions
+5. Duration=0 means instant apply (no interpolation)
+
+### Long Fade Segmentation
+
+For fades exceeding 255 seconds:
+
+1. Divide total duration into N equal segments (each ≤255s)
+2. For each segment:
+   - Calculate intermediate target (linear interpolation)
+   - Send 6 events with segment duration
+   - Wait for segment to complete
+3. All segments have equal duration = total / N
+4. Progress = (completed_segments + current_segment_progress) / N
+
+**Example: 5-minute (300s) fade**
+- 2 segments of 150s each
+- Segment 1: 50% of color delta over 150s
+- Segment 2: remaining 50% over 150s
 
 ### Implementation Details (`fade_controller.c`)
-- **Float Accumulators**: Each channel uses `float` accumulator to prevent drift
-- **Integer Transmission**: Only transmits when `(int)new_value != (int)old_value`
-- **Burst Transmission**: All 5 params sent together per round for smooth fades
-- **Rate Limiting**: Enforces 10ms minimum between transmission rounds
-- **Progress Tracking**: `elapsed_ms / duration_ms` clamped to 0.0-1.0
 - **State Machine**: IDLE → FADING → COMPLETE → IDLE
+- **Segment Tracking**: current_segment / total_segments
+- **Progress Tracking**: Overall progress across all segments for UI
+- **Equal Segments**: All segments have identical duration (simpler math)
+- **Immediate Apply**: Duration=0 sends target with 0s duration (instant)
 
 ### UI Integration
 - **Scene Selector Tab** (leftmost): Card carousel with color preview circles, "Apply" starts fade, progress bar
@@ -258,3 +282,96 @@ result = (full_rgb * intensity) / 255;
 - **Additive Light Mixing**: RGB channels combine as light, not pigments
 - **White Preservation**: High white values brighten but don't completely wash out color
 - **Perceptual Brightness**: Square root curve makes low brightness values more visible
+
+---
+
+## 8. Firmware Update (OTA) Architecture
+
+### Overview
+
+The device supports over-the-air (OTA) firmware updates via the LCC Memory Configuration
+Protocol. This enables firmware updates through JMRI's "Firmware Update" tool or the
+OpenMRN `bootloader_client` command-line utility without physical access to the device.
+
+### Boot Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ ESP32 ROM Bootloader                                            │
+│ - Always available for USB/UART recovery                        │
+├─────────────────────────────────────────────────────────────────┤
+│ ESP-IDF Second-Stage Bootloader (0x1000)                        │
+│ - Selects active OTA partition (ota_0 or ota_1)                 │
+│ - Handles rollback on boot failure                              │
+├─────────────────────────────────────────────────────────────────┤
+│ Application (ota_0 or ota_1)                                    │
+│ ├── Check RTC flag: bootloader_request                          │
+│ │   ├── TRUE  → Run bootloader mode (CAN receive loop)          │
+│ │   └── FALSE → Normal application startup (UI, LCC, etc.)      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Partition Table
+
+| Name     | Type | SubType | Offset   | Size    | Purpose                    |
+|----------|------|---------|----------|---------|----------------------------|
+| nvs      | data | nvs     | 0x9000   | 0x6000  | NVS key-value storage      |
+| otadata  | data | ota     | 0xf000   | 0x2000  | OTA boot selection data    |
+| phy_init | data | phy     | 0x11000  | 0x1000  | PHY calibration            |
+| ota_0    | app  | ota_0   | 0x20000  | 0x1E0000| Application slot A (~1.9MB)|
+| ota_1    | app  | ota_1   | 0x200000 | 0x1E0000| Application slot B (~1.9MB)|
+
+### Components
+
+| Component | File | Responsibility |
+|-----------|------|----------------|
+| Bootloader HAL | `app/bootloader_hal.cpp` | ESP32-specific OTA integration |
+| LCC Node | `app/lcc_node.cpp` | Handles "enter bootloader" command |
+| OpenMRN | `Esp32BootloaderHal.hxx` | LCC Memory Config Protocol handler |
+
+### Firmware Update Process
+
+1. **JMRI/Client** sends "Enter Bootloader" datagram to target node
+2. **lcc_node** receives command, calls `bootloader_hal_request_reboot()`
+3. **bootloader_hal** sets RTC memory flag, calls `esp_restart()`
+4. **app_main** on reboot detects flag, calls `bootloader_hal_run()`
+5. **Bootloader mode** runs minimal CAN stack (no LCD, no LVGL)
+6. **JMRI/Client** streams firmware binary to memory space 0xEF
+7. **Esp32BootloaderHal** validates and writes to alternate OTA partition
+8. **On completion** sets new partition as active, reboots into new firmware
+
+### Safety Features
+
+| Feature | Implementation |
+|---------|----------------|
+| Rollback on failure | ESP-IDF `CONFIG_APP_ROLLBACK_ENABLE` |
+| Chip ID validation | Rejects firmware for wrong ESP32 variant |
+| Image magic check | Validates ESP-IDF image header |
+| USB recovery | ROM bootloader always accessible |
+| Partition isolation | New firmware written to inactive slot |
+
+### JMRI Usage
+
+1. Connect JMRI to LCC network (CAN-USB adapter or LCC hub)
+2. Open **LCC Menu → Firmware Update**
+3. Select target node by Node ID
+4. Choose firmware `.bin` file (from `build/LCCLightingTouchscreen.bin`)
+5. Click "Download" to start update
+6. Device shows progress on LCD (blue header, status text, progress bar)
+7. Device reboots automatically when complete
+
+### Bootloader Display Module
+
+Since this board has no LEDs, the `bootloader_display` module provides visual
+feedback during firmware updates:
+
+| Status | Display |
+|--------|--------|
+| Waiting | "Waiting for firmware..." (white) |
+| Receiving | "Receiving firmware" + progress bar (yellow) |
+| Writing | "Writing to flash..." + progress bar (orange) |
+| Success | "Update successful! Rebooting..." (green) |
+| Error | "Update failed!" / "Checksum error!" (red) |
+
+The display uses direct framebuffer rendering with an embedded 8x8 bitmap font,
+avoiding the overhead of LVGL during the update process.

@@ -75,18 +75,19 @@ CONFIG_FATFS_MAX_LFN=255
 
 ### 3.1 Base Event ID Format
 
-`05.01.01.01.22.60.0x.00`
+`05.01.01.01.9F.60.0x.00`
 
 
 Where `x` selects the lighting parameter:
 
-| Parameter   | x |
-|------------|---|
-| Red        | 0 |
-| Green      | 1 |
-| Blue       | 2 |
-| White      | 3 |
-| Brightness | 4 |
+| Parameter   | x | Description |
+|------------|---|-------------|
+| Red        | 0 | Red channel target (0-255) |
+| Green      | 1 | Green channel target (0-255) |
+| Blue       | 2 | Blue channel target (0-255) |
+| White      | 3 | White channel target (0-255) |
+| Brightness | 4 | Master brightness target (0-255) |
+| Duration   | 5 | Transition time in seconds (0-255) |
 
 ### 3.2 Value Encoding
 
@@ -94,12 +95,43 @@ Where `x` selects the lighting parameter:
 - Valid range: 0–255
 - Brightness is not a multiplier; it is a peer parameter
 - Brightness behavior is implemented in WS2814 hardware
+- Duration value of 0 means instant apply (no fade)
+- Duration value of 1-255 triggers fade over that many seconds
 
-### 3.3 Transmission Rules
+### 3.3 Transmission Protocol
 
-- Each parameter update is sent as a distinct LCC event
-- Brightness should be transmitted first, then RGBW
-- No event may violate rate-limit rules
+**Duration-Triggered Fade Architecture:**
+
+The touchscreen sends all 6 parameters as a command set. The Duration event 
+triggers the fade on LED controllers, which perform local interpolation at ~60fps.
+
+1. Touchscreen sends: R, G, B, W, Brightness (target values)
+2. Touchscreen sends: Duration (triggers fade on receivers)
+3. LED controllers capture pending targets when RGBW+Br received
+4. LED controllers start local fade when Duration received
+5. Local fade runs at ~60fps for smooth transitions
+
+**Benefits of this architecture:**
+- Only 6 LCC events per scene change (minimal bus traffic)
+- High-fidelity fading at 60fps on LED controllers
+- No dropped updates due to bus congestion
+- Touchscreen is free for UI interaction during fades
+
+### 3.4 Long Fade Segmentation
+
+For fades exceeding 255 seconds (the maximum Duration value):
+
+1. Total duration is divided into N equal-length segments
+2. Each segment is ≤255 seconds
+3. Intermediate target colors are calculated proportionally
+4. Each segment sends 6 events with its portion of the transition
+5. Touchscreen tracks overall progress for UI display
+
+**Example:** 10-minute (600s) fade:
+- 3 segments of 200s each
+- Segment 1: 33% of color delta, 200s duration
+- Segment 2: 66% of color delta, 200s duration  
+- Segment 3: 100% of color delta, 200s duration
 
 ---
 
@@ -109,7 +141,7 @@ Where `x` selects the lighting parameter:
 
 Plain text file containing the 6-byte LCC node ID in dotted hex format:
 ```
-05.01.01.01.22.60
+05.01.01.01.9F.60.00
 ```
 
 Rules:
@@ -317,6 +349,50 @@ If step size < 1, increase interval to meet duration.
 
 #### FR-052
 Total duration accuracy: ±2%.
+
+---
+
+### Firmware Update (OTA)
+
+#### FR-060
+Device shall support over-the-air firmware updates via LCC Memory Configuration Protocol.
+- Uses OpenLCB Firmware Upgrade Standard (memory space 0xEF)
+- Compatible with JMRI Firmware Update tool
+- Compatible with OpenMRN bootloader_client command-line tool
+
+AC: Firmware update initiated from JMRI completes successfully and device boots new firmware.
+
+#### FR-061
+Firmware update shall use ESP-IDF OTA partition scheme.
+- Dual OTA partitions (ota_0, ota_1) for safe updates
+- Automatic rollback on boot failure (via esp_ota_mark_app_valid_cancel_rollback)
+- USB/UART flashing remains available for development
+
+AC: Failed firmware update can be recovered via USB flashing.
+
+#### FR-062
+Device shall validate firmware before accepting update.
+- ESP32 chip ID validation (rejects firmware built for wrong chip variant)
+- Image magic byte verification
+- ESP-IDF OTA APIs handle checksum validation
+
+AC: Firmware for ESP32 (non-S3) is rejected with error.
+
+#### FR-063
+Device shall enter bootloader mode when requested via LCC.
+- "Enter Bootloader" command received via Memory Configuration datagram
+- RTC memory flag set to persist across reboot
+- Minimal bootloader mode runs CAN-only (no LCD/UI)
+
+AC: Device reboots into bootloader mode within 1 second of command.
+
+#### FR-064
+Bootloader mode shall provide visual/log feedback.
+- Serial console logs bootloader state
+- Log messages indicate firmware receive progress
+- Automatic reboot on completion or timeout
+
+AC: Firmware update progress visible in serial monitor.
 
 ---
 

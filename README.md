@@ -167,7 +167,7 @@ The device reads configuration and scenes from the SD card root:
 Plain text file containing the 6-byte LCC node ID in dotted hex format:
 
 ```
-05.01.01.01.22.60
+05.01.01.01.9F.60.00
 ```
 
 ### `openmrn_config`
@@ -181,6 +181,7 @@ Binary file automatically created by OpenMRN. Stores LCC configuration data:
 **Startup Behavior**
 - Auto-Apply First Scene on Boot — Enable (1) or disable (0)
 - Auto-Apply Transition Duration — Fade time in seconds (0-300)
+- Screen Backlight Timeout — Seconds before screen sleeps (0 = disabled, 10-3600)
 
 **Lighting Configuration**
 - Base Event ID — 8-byte event ID base for lighting commands
@@ -205,30 +206,44 @@ Custom 800 x 480 px boot splash image (decoded via esp_jpeg). Cannot be saved as
 
 ## LCC Event Model
 
-Events are transmitted to control downstream RGBW lighting nodes.
+Events are transmitted to control downstream RGBW lighting nodes using a 
+**Duration-Triggered Fade Protocol**. The touchscreen sends target values and 
+transition duration; LED controllers perform local high-fidelity fading at ~60fps.
 
 ### Event ID Format
 
 ```
-05.01.01.01.22.60.0X.VV
+05.01.01.01.9F.60.0X.VV
                   │  └── Value (0-255)
                   └───── Parameter
 ```
 
 | Parameter | X | Description |
 |-----------|---|-------------|
-| Red | 0 | Red channel intensity |
-| Green | 1 | Green channel intensity |
-| Blue | 2 | Blue channel intensity |
-| White | 3 | White channel intensity |
-| Brightness | 4 | Master brightness |
+| Red | 0 | Red channel target intensity |
+| Green | 1 | Green channel target intensity |
+| Blue | 2 | Blue channel target intensity |
+| White | 3 | White channel target intensity |
+| Brightness | 4 | Master brightness target |
+| Duration | 5 | Fade time in seconds (0=instant) |
 
-### Transmission Rules
+### How It Works
 
-- Minimum interval: **10 ms** between transmission rounds
-- Transmission mode: **Burst** (all 5 params sent together)
-- Transmission order: Brightness → R → G → B → W
-- All 5 parameters sent on Apply
+1. **Touchscreen sends 6 events**: R, G, B, W, Brightness, Duration
+2. **LED controllers store** R, G, B, W, Brightness as pending values
+3. **Duration event triggers** the fade from current to pending values
+4. **Local interpolation** runs at ~60fps on LED controllers
+5. **Minimal bus traffic**: Only 6 events per scene change
+
+### Long Fades (>255 seconds)
+
+For fades exceeding 255 seconds:
+- Total duration is divided into equal segments (each ≤255s)
+- Intermediate target colors are calculated proportionally
+- Example: 5-minute fade = 2 segments of 150s each
+
+This architecture provides smooth, high-fidelity lighting transitions while 
+minimizing LCC bus traffic and freeing the touchscreen for UI interaction.
 
 ## LCC Configuration (CDI)
 
@@ -250,7 +265,7 @@ The following settings can be configured via any LCC configuration tool (JMRI, e
 ### Lighting Configuration
 | Setting | Default | Description |
 |---------|---------|-------------|
-| Base Event ID | 05.01.01.01.22.60.00.00 | Base for lighting event IDs |
+| Base Event ID | 05.01.01.01.9F.60.00.00 | Base for lighting event IDs |
 
 ## User Interface
 
@@ -316,6 +331,33 @@ save power. Touch the screen to wake it.
 Configuration via LCC tools (JMRI, etc.):
 - Set to 0 to keep screen always on
 - Minimum enabled timeout is 10 seconds
+
+### Firmware Updates (OTA)
+
+The device supports over-the-air firmware updates via the LCC Memory Configuration
+Protocol. This allows firmware updates through JMRI without physical access to the device.
+
+**Using JMRI:**
+1. Connect JMRI to your LCC network
+2. Open **LCC Menu → Firmware Update**
+3. Select the touchscreen controller by Node ID
+4. Choose the firmware file (`build/LCCLightingTouchscreen.bin`)
+5. Click "Download" — device reboots automatically when complete
+
+**Safety Features:**
+- **Dual OTA partitions**: New firmware written to inactive slot; old firmware preserved
+- **Automatic rollback**: If new firmware fails to boot, reverts to previous version
+- **Chip validation**: Rejects firmware built for wrong ESP32 variant
+- **USB recovery**: Standard USB flashing always available as fallback
+
+**How it works:**
+- JMRI sends "Enter Bootloader" command to the device
+- Device reboots into bootloader mode with LCD status display
+- Screen shows "FIRMWARE UPDATE MODE" header with progress bar
+- Firmware is streamed via LCC datagrams to memory space 0xEF
+- ESP-IDF OTA APIs write to alternate partition
+- On completion, new partition is activated and device reboots
+
 
 ## Architecture
 
