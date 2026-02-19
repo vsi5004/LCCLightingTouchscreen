@@ -1,0 +1,32 @@
+{
+	"version":	1,
+	"scenes":	[{
+			"name":	"Daylight",
+			"brightness":	255,
+			"r":	179,
+			"g":	161,
+			"b":	130,
+			"w":	255
+		}, {
+			"name":	"Night",
+			"brightness":	140,
+			"r":	1,
+			"g":	0,
+			"b":	255,
+			"w":	48
+		}, {
+			"name":	"OFF",
+			"brightness":	0,
+			"r":	0,
+			"g":	0,
+			"b":	0,
+			"w":	0
+		}, {
+			"name":	"FULL BLAST",
+			"brightness":	255,
+			"r":	255,
+			"g":	255,
+			"b":	255,
+			"w":	255
+		}]
+}
