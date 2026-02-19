@@ -127,9 +127,20 @@ See **[FLASHING.md](FLASHING.md)** for the full guide.
 
 ## SD Card Setup
 
-The device reads configuration and scenes from the SD card root:
+The device reads configuration and scenes from the SD card root.
 
-### `nodeid.txt`
+### Quick Start
+
+The `sdcard/` directory in this repository contains template files that you can copy directly to your SD card:
+
+1. Format your SD card as FAT32
+2. Copy all files from the `sdcard/` folder to the root of your SD card
+3. Edit `nodeid.txt` with your unique LCC node ID (see below)
+4. Optionally customize `scenes.json` with your preferred lighting presets
+
+### File Reference
+
+#### `nodeid.txt`
 
 Plain text file containing the 48-bit LCC node ID in dotted hex format:
 
@@ -149,7 +160,7 @@ The firmware includes a default node ID (`LCC_DEFAULT_NODE_ID` in `main/app/lcc_
 
 See [FLASHING.md - Node ID Configuration](FLASHING.md#node-id-configuration) for details on customizing the compiled default.
 
-### `openmrn_config`
+#### `openmrn_config`
 
 Binary file automatically created by OpenMRN. Stores LCC configuration data:
 
@@ -167,7 +178,7 @@ Binary file automatically created by OpenMRN. Stores LCC configuration data:
 
 All settings are configurable via any LCC configuration tool (JMRI, etc.).
 
-### `scenes.json`
+#### `scenes.json`
 
 ```json
 {
@@ -179,7 +190,7 @@ All settings are configurable via any LCC configuration tool (JMRI, etc.).
 }
 ```
 
-### `splash.jpg`
+#### `splash.jpg`
 
 Custom 800 x 480 px boot splash image (decoded via esp_jpeg). Cannot be saved as "progressive" jpg
 
