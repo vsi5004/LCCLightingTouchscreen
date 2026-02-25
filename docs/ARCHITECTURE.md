@@ -176,12 +176,21 @@ ACTIVE ──(timeout)──→ FADING_OUT ──(fade complete)──→ OFF
 - `screen_timeout_init()`: Initialize with CH422G handle and timeout from LCC config
 - `screen_timeout_tick()`: Called every 500ms from main loop to check timeout
 - `screen_timeout_notify_activity()`: Called from touch callback to reset timer
+- `screen_timeout_is_interactive()`: Returns true only when screen is fully on (ACTIVE state)
+
+**Touch Suppression:**
+The LVGL touch callback (`lvgl_touch_cb` in `ui_common.c`) always notifies the
+screen timeout module on touch, but only forwards touch coordinates to LVGL when
+`screen_timeout_is_interactive()` returns true. During OFF, FADING_OUT, and
+FADING_IN states, touches report `LV_INDEV_STATE_RELEASED` to LVGL — the waking
+touch triggers the fade-in animation but does not activate any UI element.
 
 **Fade Animation:**
 - Uses LVGL overlay on `lv_layer_top()` for smooth black fade effect
 - 1 second fade-out before backlight turns off (less jarring than abrupt shutoff)
 - 1 second fade-in when waking to restore UI gradually
 - Touch during fade-out aborts and transitions to fade-in
+- Touch input suppressed during fade transitions (waking touch does not affect UI)
 - Animation uses `lv_anim` with opacity interpolation (LV_OPA_TRANSP ↔ LV_OPA_COVER)
 - **Stepped Opacity**: Uses 20 discrete opacity levels to reduce banding artifacts
   caused by RGB LCD bounce buffer partial frame updates

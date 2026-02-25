@@ -24,6 +24,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_vfs.h"
 
 #include "openlcb/SimpleStack.hxx"
@@ -512,14 +513,26 @@ esp_err_t lcc_node_init(const lcc_config_t *config)
     ESP_LOGI(TAG, "Adding CAN port...");
     s_stack->add_can_port_select("/dev/twai/twai0");
 
-    // Start the executor thread - this also calls default_start_node() which
-    // registers the default FileMemorySpace
-    ESP_LOGI(TAG, "Starting executor thread...");
-    s_stack->start_executor_thread("lcc_exec", 5, 4096);
+    // Start the executor thread with delay_start=true. This prevents the
+    // node from announcing itself (Initialization Complete) on the LCC bus
+    // until we finish registering custom memory spaces below.
+    //
+    // Without this, there is a race condition: the executor thread runs at
+    // priority 5 (higher than main task at priority 1), so it preempts
+    // immediately after creation. If JMRI sends queries in response to the
+    // Initialization Complete message, the executor calls registry.lookup()
+    // concurrently with the main thread calling registry.insert() to add
+    // the custom SyncingFileMemorySpace instances. Since std::map is not
+    // thread-safe for concurrent read+write, this corrupts the map and
+    // causes a crash — explaining why the device reboots on the first LCC
+    // scan after power-on but not on subsequent scans (no more inserts).
+    ESP_LOGI(TAG, "Starting executor thread (delayed start)...");
+    s_stack->start_executor_thread("lcc_exec", 5, 8192, true);
 
-    // Register our custom SyncingFileMemorySpace instances to replace the defaults.
-    // These call fsync() after every write to ensure data is persisted to SD card
-    // and subsequent reads return the updated values.
+    // Register our custom SyncingFileMemorySpace instances to replace the
+    // defaults registered by default_start_node(). These call fsync() after
+    // every write to ensure data is persisted to SD card.
+    // IMPORTANT: Must happen BEFORE start_after_delay() to avoid the race.
     
     // Space 253 (SPACE_CONFIG) - main configuration space
     s_config_space = new SyncingFileMemorySpace(config_fd, openlcb::CONFIG_FILE_SIZE);
@@ -530,6 +543,11 @@ esp_err_t lcc_node_init(const lcc_config_t *config)
     s_acdi_usr_space = new SyncingFileMemorySpace(config_fd, 128);
     s_stack->memory_config_handler()->registry()->insert(
         s_stack->node(), openlcb::MemoryConfigDefs::SPACE_ACDI_USR, s_acdi_usr_space);
+
+    // Now announce the node on the LCC bus. All memory spaces are correctly
+    // registered, so incoming queries will be handled safely.
+    ESP_LOGI(TAG, "Announcing LCC node on bus...");
+    s_stack->start_after_delay();
 
     s_status = LCC_STATUS_RUNNING;
     ESP_LOGI(TAG, "LCC node initialized and running");
@@ -619,6 +637,26 @@ void lcc_node_shutdown(void)
     
     // Don't delete the stack or TWAI - they don't support clean shutdown
     // and the device is likely resetting anyway
+}
+
+/// Override OpenMRN's weak reboot() so that COMMAND_RESET (0xA9) and
+/// factory-reset-then-reboot actually restart the ESP32 instead of being
+/// a no-op.
+void reboot()
+{
+    ESP_LOGI(TAG, "Reboot requested via LCC");
+    vTaskDelay(pdMS_TO_TICKS(200));
+    esp_restart();
+}
+
+/// Override OpenMRN's weak enter_bootloader() so that COMMAND_FREEZE on
+/// space 0xEF / COMMAND_ENTER_BOOTLOADER (0xAB) actually reboots into
+/// bootloader mode for firmware updates.
+void enter_bootloader()
+{
+    ESP_LOGI(TAG, "Enter bootloader requested via LCC");
+    bootloader_hal_request_reboot();
+    // Does not return — device restarts into bootloader mode
 }
 
 } // extern "C"

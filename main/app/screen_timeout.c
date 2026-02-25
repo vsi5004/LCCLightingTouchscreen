@@ -376,6 +376,19 @@ bool screen_timeout_is_screen_on(void)
     return on;
 }
 
+bool screen_timeout_is_interactive(void)
+{
+    bool active = true;
+    
+    if (s_state.initialized && 
+        xSemaphoreTake(s_state.mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        active = (s_state.state == SCREEN_STATE_ACTIVE);
+        xSemaphoreGive(s_state.mutex);
+    }
+    
+    return active;
+}
+
 void screen_timeout_wake(void)
 {
     if (!s_state.initialized) {

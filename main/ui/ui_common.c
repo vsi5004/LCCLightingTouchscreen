@@ -71,12 +71,19 @@ static void lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
     esp_err_t ret = esp_lcd_touch_get_data(touch, &point_data, &point_cnt, 1);
 
     if (ret == ESP_OK && point_cnt > 0) {
-        data->point.x = point_data.x;
-        data->point.y = point_data.y;
-        data->state = LV_INDEV_STATE_PRESSED;
-        
-        // Notify screen timeout module of touch activity
+        // Always notify screen timeout so the wake-up is triggered
         screen_timeout_notify_activity();
+        
+        // Only forward the touch to LVGL when the screen is fully on.
+        // This prevents the waking touch (and any touches during the
+        // fade-in animation) from accidentally triggering UI actions.
+        if (screen_timeout_is_interactive()) {
+            data->point.x = point_data.x;
+            data->point.y = point_data.y;
+            data->state = LV_INDEV_STATE_PRESSED;
+        } else {
+            data->state = LV_INDEV_STATE_RELEASED;
+        }
     } else {
         data->state = LV_INDEV_STATE_RELEASED;
     }

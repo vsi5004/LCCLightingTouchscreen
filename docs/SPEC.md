@@ -245,10 +245,11 @@ Screen backlight timeout for power saving:
 - Configurable timeout via LCC configuration (default: 60 seconds)
 - Set to 0 to disable timeout (always on)
 - Minimum enabled timeout: 10 seconds, maximum: 3600 seconds
-- Touch-to-wake: Any touch restores backlight immediately
+- Touch-to-wake: Any touch restores backlight with fade-in animation
+- Waking touch is consumed — no UI actions until screen is fully on
 - Backlight is on/off only (not dimmable - hardware limitation)
 
-AC: Backlight turns off after configured idle period; touch wakes screen.
+AC: Backlight turns off after configured idle period; touch wakes screen without triggering UI actions.
 
 ### Main UI
 
